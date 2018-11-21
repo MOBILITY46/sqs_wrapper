@@ -69,6 +69,14 @@ impl Client {
         }
     }
 
+    pub fn purge(&self) -> RusotoFuture<(), sqs::PurgeQueueError> {
+        let req = sqs::PurgeQueueRequest {
+            queue_url: self.queue_url.clone(),
+        };
+
+        self.c.purge_queue(req)
+    }
+
     pub fn enqueue_message(
         &self,
         payload: String,
@@ -140,6 +148,7 @@ mod tests {
     use std::time::SystemTime;
     use std::{env, sync::Arc};
 
+    use super::futures::{future, Future};
     use super::*;
 
     fn setup_test() -> (Client, Runtime) {
@@ -149,14 +158,23 @@ mod tests {
 
         let c = Client::new(rusoto_core::Region::EuCentral1, url.unwrap());
         let rt = Runtime::new();
-        assert!(rt.is_ok(), "Runtime failed to initialize");
 
-        (c, rt.unwrap())
+        assert!(rt.is_ok(), "Runtime failed to initialize");
+        let mut rt = rt.unwrap();
+        // let purge_res = rt.block_on(c.purge());
+        // assert!(
+        //     purge_res.is_ok(),
+        //     "Error when purging queue: {:?}",
+        //     purge_res.err()
+        // );
+
+        (c, rt)
     }
 
     #[test]
     fn test_enqueue_and_delete_message() {
         let (mut c, mut rt) = setup_test();
+
         c.wait_time = 1;
 
         let now = SystemTime::now()
@@ -205,6 +223,67 @@ mod tests {
         let delete_res = rt.block_on(c.delete_message(receipt_handle));
 
         assert!(delete_res.is_ok(), "Error deleting the message");
+    }
+
+    #[test]
+    fn test_message_stream() {
+        let (mut c, mut rt) = setup_test();
+        c.wait_time = 1;
+        let c = Arc::new(c);
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        let msgs_to_send = 20_usize;
+
+        let enqueued = {
+            let now = (now.as_secs() * 1000) + now.subsec_millis() as u64;
+            let c = c.clone();
+            // push some messages
+            let to_send = (1..=msgs_to_send)
+                .map(move |i| {
+                    format!(
+                        "{{ \"payload\": \"Stream test {}\", \"timestamp\": \"{}\"}}",
+                        i, now
+                    )
+                })
+                .map(move |payload| c.clone().enqueue_message(payload));
+
+            let enqueued = rt.block_on(future::join_all(to_send));
+
+            assert!(enqueued.is_ok(), "Error enqueueing messages");
+            enqueued.unwrap()
+        };
+
+        assert_eq!(
+            msgs_to_send,
+            enqueued.len(),
+            "All enqueued messages were not successful"
+        );
+
+        let streamed_res = c
+            .clone()
+            .stream_messages()
+            .take(msgs_to_send as u64)
+            .collect();
+
+        let streamed_res = rt.block_on(streamed_res);
+        assert!(streamed_res.is_ok());
+        let streamed_res = streamed_res.unwrap();
+
+        let delete_futs = streamed_res
+            .into_iter()
+            .filter_map(|msg| msg.receipt_handle)
+            .map(move |receipt_handle| c.clone().delete_message(receipt_handle))
+            .collect::<Vec<_>>();
+
+        let delete_res = rt.block_on(future::join_all(delete_futs));
+        assert!(delete_res.is_ok(), "Error deleting messages");
+
+        let delete_res = delete_res.unwrap();
+
+        assert_eq!(msgs_to_send, delete_res.len());
     }
 
 }
