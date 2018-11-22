@@ -13,4 +13,3 @@ log = "0.4"
 [dev-dependencies]
 tokio = "0.1"
 rusoto_credential = "0.14"
-dotenv = "0.13"
