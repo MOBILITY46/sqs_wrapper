@@ -14,7 +14,7 @@ mod queue_settings;
 pub use queue_settings::QueueSettings;
 
 pub struct RecordStream {
-    client: Queue,
+    queue: Queue,
     future: RusotoFuture<sqs::ReceiveMessageResult, sqs::ReceiveMessageError>,
     message_buffer: Vec<sqs::Message>,
 }
@@ -47,7 +47,7 @@ impl Stream for RecordStream {
                     None => (),
                 }
 
-                self.future = self.client.receive_messages();
+                self.future = self.queue.receive_messages();
                 self.poll()
             }
         }
@@ -166,7 +166,7 @@ impl Queue {
         let initial_future = self.receive_messages();
 
         RecordStream {
-            client: Queue {
+            queue: Queue {
                 queue_url: self.queue_url.clone(),
                 region: self.region.clone(),
                 c: sqs::SqsClient::new(self.region.clone()),
