@@ -17,6 +17,7 @@ pub struct RecordStream {
     queue: Queue,
     future: RusotoFuture<sqs::ReceiveMessageResult, sqs::ReceiveMessageError>,
     message_buffer: Vec<sqs::Message>,
+    wait_time_seconds: i64,
 }
 
 impl Stream for RecordStream {
@@ -47,7 +48,7 @@ impl Stream for RecordStream {
                     None => (),
                 }
 
-                self.future = self.queue.receive_messages();
+                self.future = self.queue.receive_messages(self.wait_time_seconds);
                 self.poll()
             }
         }
@@ -136,6 +137,7 @@ impl Queue {
 
     pub fn receive_messages(
         &self,
+        wait_time_seconds: i64,
     ) -> RusotoFuture<sqs::ReceiveMessageResult, sqs::ReceiveMessageError> {
         let msg = sqs::ReceiveMessageRequest {
             attribute_names: Some(vec!["ALL".into()]),
@@ -144,7 +146,7 @@ impl Queue {
             queue_url: self.queue_url.clone(),
             receive_request_attempt_id: None, // FIFO ONLY
             visibility_timeout: None,
-            wait_time_seconds: None,
+            wait_time_seconds: Some(wait_time_seconds),
         };
 
         self.c.receive_message(msg)
@@ -162,8 +164,8 @@ impl Queue {
         self.c.delete_message(msg)
     }
 
-    pub fn stream_messages(&self) -> RecordStream {
-        let initial_future = self.receive_messages();
+    pub fn stream_messages(&self, wait_time_seconds: i64) -> RecordStream {
+        let initial_future = self.receive_messages(wait_time_seconds);
 
         RecordStream {
             queue: Queue {
@@ -173,6 +175,7 @@ impl Queue {
             },
             future: initial_future,
             message_buffer: Vec::with_capacity(10),
+            wait_time_seconds: wait_time_seconds,
         }
     }
 }
