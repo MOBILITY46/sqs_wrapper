@@ -3,6 +3,7 @@ extern crate log;
 extern crate rusoto_core;
 extern crate rusoto_sqs;
 
+use log::trace;
 use std::collections::HashMap;
 
 use futures::{Async, Future, Poll, Stream};
@@ -48,6 +49,7 @@ impl Stream for RecordStream {
                     None => (),
                 }
 
+                trace!("Polling queue");
                 self.future = self.queue.receive_messages(self.wait_time_seconds);
                 self.poll()
             }
