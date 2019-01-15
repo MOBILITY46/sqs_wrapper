@@ -3,8 +3,10 @@ extern crate log;
 extern crate rusoto_core;
 extern crate rusoto_sqs;
 
-use log::trace;
-use std::collections::HashMap;
+use log::{info, trace};
+use serde::de::DeserializeOwned;
+#[allow(unused_imports)]
+use std::{collections::HashMap, error::Error as StdError, str::FromStr};
 
 use futures::{Async, Future, Poll, Stream};
 use rusoto_core::{Region, RusotoFuture};
@@ -12,18 +14,79 @@ use rusoto_sqs::{self as sqs, Sqs};
 
 mod queue_settings;
 
-pub use queue_settings::QueueSettings;
+pub use crate::queue_settings::QueueSettings;
+pub use rusoto_sqs::ReceiveMessageError;
 
-pub struct RecordStream {
-    queue: Queue,
-    future: RusotoFuture<sqs::ReceiveMessageResult, sqs::ReceiveMessageError>,
-    message_buffer: Vec<sqs::Message>,
+#[derive(Debug)]
+pub enum Error {
+    Sqs(sqs::ReceiveMessageError),
+    Json(serde_json::Error),
+}
+
+#[derive(Debug)]
+pub struct QueueItem<T>
+where
+    T: Send + 'static,
+{
+    pub message_id: String,
+    pub receipt_handle: String,
+    pub attributes: Option<HashMap<String, String>>,
+    pub body: T,
+}
+
+impl<T> QueueItem<T>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    fn try_from(msg: sqs::Message) -> Option<Result<QueueItem<T>, serde_json::Error>> {
+        let msg_id = msg
+            .message_id
+            .ok_or_else(|| info!("Dropping message without message_id"))
+            .ok()?;
+        let receipt_handle = msg
+            .receipt_handle
+            .ok_or_else(|| info!("Dropping message({:?}) without receipt_handle", msg_id))
+            .ok()?;
+        let body = msg
+            .body
+            .ok_or_else(|| info!("Dropping message({:?}) without body", msg_id))
+            .ok()?;
+
+        match serde_json::from_str(&body) {
+            Err(parse_err) => {
+                info!(
+                    "Dropping message({:?}) with invalid body, parse error: {}",
+                    &msg_id, parse_err
+                );
+                None
+            }
+            Ok(parsed_body) => Some(Ok(QueueItem {
+                message_id: msg_id,
+                receipt_handle: receipt_handle,
+                attributes: msg.attributes,
+                body: parsed_body,
+            })),
+        }
+    }
+}
+
+pub struct RecordStream<T>
+where
+    T: Send + 'static,
+{
+    queue: Queue<T>,
+    future: Box<dyn Future<Item = Vec<QueueItem<T>>, Error = Error> + Send + 'static>,
+    message_buffer: Vec<QueueItem<T>>,
     wait_time_seconds: i64,
 }
 
-impl Stream for RecordStream {
-    type Item = sqs::Message;
-    type Error = sqs::ReceiveMessageError;
+impl<T> Stream for RecordStream<T>
+where
+    T: DeserializeOwned,
+    T: Send + 'static,
+{
+    type Item = QueueItem<T>;
+    type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if !self.message_buffer.is_empty() {
@@ -37,39 +100,48 @@ impl Stream for RecordStream {
             Err(err) => {
                 return Err(err);
             }
-            Ok(Async::Ready(res)) => {
-                // Request more
-                match res.messages {
-                    Some(messages) => {
-                        messages
-                            .into_iter()
-                            .for_each(|msg| self.message_buffer.push(msg));
-                    }
-
-                    None => (),
-                }
-
-                trace!("Polling queue");
-                self.future = self.queue.receive_messages(self.wait_time_seconds);
-                self.poll()
+            Ok(Async::Ready(messages)) => {
+                // For now we just drop all messages that could not be parsed. But we print the reason.
+                messages
+                    .into_iter()
+                    .for_each(|msg| self.message_buffer.push(msg))
+                //     res.messages
+                //         .into_iter()
+                //         .flatten()
+                //         .filter_map(|msg: sqs::Message| QueueItem::try_from(msg))
+                //         .filter_map(|opt_item| opt_item.ok())
+                //         .for_each(|msg: QueueItem<T>| self.message_buffer.push(msg));
             }
         }
+
+        trace!("Polling queue");
+        self.future = Box::new(self.queue.receive_messages(self.wait_time_seconds));
+        self.poll()
     }
 }
 
-pub struct Queue {
+pub struct Queue<T>
+where
+    T: Send + 'static,
+{
     queue_url: String,
     region: Region,
     c: sqs::SqsClient,
+
+    _phantom_data: std::marker::PhantomData<T>,
 }
 
 /// Try to convert the example in wait_and_read_one to use futures and Tokio.
-impl Queue {
-    pub fn connect<S: Into<String>>(region: Region, queue_url: S) -> Self {
+impl<T> Queue<T>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    pub fn connect(region: Region, queue_url: String) -> Self {
         Queue {
             c: sqs::SqsClient::new(region.clone()),
             region: region.clone(),
-            queue_url: queue_url.into(),
+            queue_url: queue_url,
+            _phantom_data: std::marker::PhantomData,
         }
     }
 
@@ -77,7 +149,7 @@ impl Queue {
         region: Region,
         name: String,
         settings: QueueSettings,
-    ) -> impl Future<Item = Queue, Error = sqs::CreateQueueError> {
+    ) -> impl Future<Item = Queue<T>, Error = sqs::CreateQueueError> {
         let mut attrs: HashMap<String, String> = HashMap::new();
 
         if let Some(secs) = settings.delay_seconds {
@@ -110,6 +182,7 @@ impl Queue {
             queue_url: res.queue_url.unwrap(),
             region: region,
             c: client,
+            _phantom_data: std::marker::PhantomData,
         })
     }
 
@@ -140,7 +213,7 @@ impl Queue {
     pub fn receive_messages(
         &self,
         wait_time_seconds: i64,
-    ) -> RusotoFuture<sqs::ReceiveMessageResult, sqs::ReceiveMessageError> {
+    ) -> impl Future<Item = Vec<QueueItem<T>>, Error = Error> {
         let msg = sqs::ReceiveMessageRequest {
             attribute_names: Some(vec!["ALL".into()]),
             max_number_of_messages: None,
@@ -151,7 +224,18 @@ impl Queue {
             wait_time_seconds: Some(wait_time_seconds),
         };
 
-        self.c.receive_message(msg)
+        self.c
+            .receive_message(msg)
+            .map_err(|err| Error::Sqs(err))
+            .map(|sqs_msg| {
+                sqs_msg
+                    .messages
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|msg: sqs::Message| QueueItem::try_from(msg))
+                    .filter_map(|opt_item| opt_item.ok())
+                    .collect::<Vec<_>>()
+            })
     }
 
     pub fn delete_message(
@@ -166,7 +250,7 @@ impl Queue {
         self.c.delete_message(msg)
     }
 
-    pub fn stream_messages(&self, wait_time_seconds: i64) -> RecordStream {
+    pub fn stream_messages(&self, wait_time_seconds: i64) -> RecordStream<T> {
         let initial_future = self.receive_messages(wait_time_seconds);
 
         RecordStream {
@@ -174,8 +258,9 @@ impl Queue {
                 queue_url: self.queue_url.clone(),
                 region: self.region.clone(),
                 c: sqs::SqsClient::new(self.region.clone()),
+                _phantom_data: std::marker::PhantomData,
             },
-            future: initial_future,
+            future: Box::new(initial_future),
             message_buffer: Vec::with_capacity(10),
             wait_time_seconds: wait_time_seconds,
         }
@@ -185,104 +270,74 @@ impl Queue {
 #[cfg(test)]
 mod tests {
 
-    extern crate tokio;
-
-    use self::tokio::runtime::Runtime;
     use std::sync::Arc;
     use std::time::SystemTime;
+    use tokio::runtime::Runtime;
+
+    use serde_derive::{Deserialize, Serialize};
 
     use super::futures::future;
     use super::*;
 
-    fn with_queue<F>(test_name: &'static str, f: F)
+    #[derive(Deserialize, Serialize)]
+    struct TestItem {
+        message: String,
+    }
+
+    fn with_queue<F>(f: F)
     where
-        F: FnOnce((Arc<Queue>, &mut Runtime)) -> (),
+        F: FnOnce((Arc<Queue<TestItem>>, &mut Runtime)) -> (),
     {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-
-        let now = (now.as_secs() * 1000) + now.subsec_millis() as u64;
-        let queue_name = format!("sqs-wrapper-test-{}-{}", test_name, now);
-
-        let mut settings = QueueSettings::default();
-        settings.delay_seconds = Some(0);
-
-        let queue_f = Queue::create(Region::EuCentral1, queue_name, settings);
+        let queue = Queue::<TestItem>::connect(
+            Region::EuCentral1,
+            "https://sqs.eu-central-1.amazonaws.com/396885474243/sqs_wrapper_test_queue".into(),
+        );
 
         let rt = Runtime::new();
         assert!(rt.is_ok(), "Runtime failed to initialize");
         let mut rt = rt.unwrap();
 
-        let queue = rt.block_on(queue_f);
-        assert!(queue.is_ok(), "Failed to create queue");
-        let queue = queue.unwrap();
-
-        let queue_url = queue.queue_url.clone();
-        let region = queue.region.clone();
-
         f((Arc::new(queue), &mut rt));
-
-        delete_queue(region, queue_url, &mut rt);
-    }
-
-    fn delete_queue(region: Region, queue_url: String, rt: &mut Runtime) {
-        let client = sqs::SqsClient::new(region.clone());
-
-        let delete_res = rt.block_on(client.delete_queue(sqs::DeleteQueueRequest {
-            queue_url: queue_url,
-        }));
-        assert!(
-            delete_res.is_ok(),
-            "Failed to delete queue: {:?}",
-            delete_res.err()
-        );
     }
 
     #[test]
     fn test_enqueue_and_delete_message() {
-        with_queue("simple-enqueue", |(queue, rt)| {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap();
-
-            let payload = format!(
-                "{{ \"payload\": \"My cool payload used for testing\", \"timestamp\": \"{}.{}\"}}",
-                now.as_secs(),
-                now.subsec_millis(),
-            );
+        with_queue(|(queue, rt)| {
+            let payload = serde_json::to_string(&TestItem {
+                message: "herpderp".into(),
+            })
+            .unwrap();
 
             // ENQUEUE
             let enq_res = rt.block_on(queue.enqueue_message(payload.clone()));
-            assert!(enq_res.is_ok(), "Error enqueuing message");
 
-            let enq_res = enq_res.unwrap();
+            let enq_res = match enq_res {
+                Ok(res) => res,
+
+                Err(rusoto_sqs::SendMessageError::Unknown(raw)) => panic!(
+                    "Enqueing message failed:\n{}",
+                    std::str::from_utf8(&raw.body).unwrap()
+                ),
+
+                Err(e) => panic!("Enqueing message failed: {}", e),
+            };
+
             assert!(enq_res.message_id.is_some(), "Message ID was None");
 
             let message_id = enq_res.message_id.unwrap();
             assert!(0 < message_id.len(), "Message ID was empty string");
 
             // DEQUEUE
-            let deq_res = rt.block_on(queue.receive_messages());
+            let deq_res = rt.block_on(queue.receive_messages(10));
             assert!(deq_res.is_ok(), "Error receiving messages");
 
-            let deq_res = deq_res.unwrap();
-            assert!(deq_res.messages.is_some(), "Messages was None");
-            let deq_messages = deq_res.messages.unwrap();
-
+            let deq_messages = deq_res.unwrap();
             assert!(0 < deq_messages.len(), "Received no messages");
+
             let deq_message = deq_messages.get(0).unwrap();
-            assert!(deq_message.body.is_some(), "Dequeued message body was None");
-            assert_eq!(deq_message.body, Some(payload));
 
             // DELETE
             let receipt_handle = deq_message.receipt_handle.clone();
-            assert!(
-                receipt_handle.is_some(),
-                "Receipt handle was None, cannot delete!"
-            );
-
-            let receipt_handle = receipt_handle.unwrap();
             assert!(0 < receipt_handle.len(), "Receipt handle was empty string");
 
             let delete_res = rt.block_on(queue.delete_message(receipt_handle));
@@ -293,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_message_stream() {
-        with_queue("streaming", |(queue, rt)| {
+        with_queue(|(queue, rt)| {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap();
@@ -306,16 +361,21 @@ mod tests {
                 // push some messages
                 let to_send = (1..=msgs_to_send)
                     .map(move |i| {
-                        format!(
+                        let msg = format!(
                             "{{ \"payload\": \"Stream test {}\", \"timestamp\": \"{}\"}}",
                             i, now
-                        )
+                        );
+
+                        serde_json::to_string(&TestItem { message: msg }).unwrap()
                     })
                     .map(move |payload| queue.clone().enqueue_message(payload));
 
                 let enqueued = rt.block_on(future::join_all(to_send));
 
-                assert!(enqueued.is_ok(), "Error enqueueing messages");
+                assert!(
+                    enqueued.is_ok(),
+                    ("Error enqueueing messages: {}", enqueued.err())
+                );
                 enqueued.unwrap()
             };
 
@@ -327,12 +387,14 @@ mod tests {
 
             let streamed_res = queue
                 .clone()
-                .stream_messages()
+                .stream_messages(5)
                 .take(msgs_to_send as u64)
                 .collect();
 
-            let streamed_res = rt.block_on(streamed_res);
-            assert!(streamed_res.is_ok());
+            match rt.block_on(streamed_res) {
+                Ok(_) => (),
+                Err(e) => panic!("Stream got error: {:?}", e),
+            }
         });
     }
 
