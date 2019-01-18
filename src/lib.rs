@@ -3,42 +3,38 @@ extern crate log;
 extern crate rusoto_core;
 extern crate rusoto_sqs;
 
+use futures::{Async, Future, Poll, Stream};
 use log::{info, trace};
+use rusoto_core::{Region, RusotoFuture};
+use rusoto_sqs::{self as sqs, Sqs};
 use serde::de::DeserializeOwned;
 #[allow(unused_imports)]
 use std::{collections::HashMap, error::Error as StdError, str::FromStr};
 
-use futures::{Async, Future, Poll, Stream};
-use rusoto_core::{Region, RusotoFuture};
-use rusoto_sqs::{self as sqs, Sqs};
-
+mod error;
 mod queue_settings;
+
+pub use error::Error;
 
 pub use crate::queue_settings::QueueSettings;
 pub use rusoto_sqs::ReceiveMessageError;
 
 #[derive(Debug)]
-pub enum Error {
-    Sqs(sqs::ReceiveMessageError),
-    Json(serde_json::Error),
-}
-
-#[derive(Debug)]
 pub struct QueueItem<T>
 where
-    T: Send + 'static,
+    T: DeserializeOwned + Send + 'static,
 {
     pub message_id: String,
     pub receipt_handle: String,
     pub attributes: Option<HashMap<String, String>>,
-    pub body: T,
+    pub body: Result<T, serde_json::Error>,
 }
 
 impl<T> QueueItem<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
-    fn try_from(msg: sqs::Message) -> Option<Result<QueueItem<T>, serde_json::Error>> {
+    fn try_from(msg: sqs::Message) -> Option<QueueItem<T>> {
         let msg_id = msg
             .message_id
             .ok_or_else(|| info!("Dropping message without message_id"))
@@ -52,27 +48,20 @@ where
             .ok_or_else(|| info!("Dropping message({:?}) without body", msg_id))
             .ok()?;
 
-        match serde_json::from_str(&body) {
-            Err(parse_err) => {
-                info!(
-                    "Dropping message({:?}) with invalid body, parse error: {}",
-                    &msg_id, parse_err
-                );
-                None
-            }
-            Ok(parsed_body) => Some(Ok(QueueItem {
-                message_id: msg_id,
-                receipt_handle: receipt_handle,
-                attributes: msg.attributes,
-                body: parsed_body,
-            })),
-        }
+        let queue_item = QueueItem {
+            message_id: msg_id,
+            receipt_handle: receipt_handle,
+            attributes: msg.attributes,
+            body: serde_json::from_str(&body),
+        };
+
+        Some(queue_item)
     }
 }
 
 pub struct RecordStream<T>
 where
-    T: Send + 'static,
+    T: DeserializeOwned + Send + 'static,
 {
     queue: Queue<T>,
     future: Box<dyn Future<Item = Vec<QueueItem<T>>, Error = Error> + Send + 'static>,
@@ -115,7 +104,7 @@ where
         }
 
         trace!("Polling queue");
-        self.future = Box::new(self.queue.receive_messages(self.wait_time_seconds));
+        self.future = Box::new(self.queue.receive_messages_async(self.wait_time_seconds));
         self.poll()
     }
 }
@@ -210,10 +199,10 @@ where
         self.c.send_message(req)
     }
 
-    pub fn receive_messages(
+    pub(crate) fn receive_messages_async(
         &self,
         wait_time_seconds: i64,
-    ) -> impl Future<Item = Vec<QueueItem<T>>, Error = Error> {
+    ) -> impl Future<Item = Vec<QueueItem<T>>, Error = Error> + Send + Sized + 'static {
         let msg = sqs::ReceiveMessageRequest {
             attribute_names: Some(vec!["ALL".into()]),
             max_number_of_messages: None,
@@ -226,14 +215,41 @@ where
 
         self.c
             .receive_message(msg)
-            .map_err(|err| Error::Sqs(err))
+            .map_err(Error::from)
             .map(|sqs_msg| {
                 sqs_msg
                     .messages
                     .into_iter()
                     .flatten()
                     .filter_map(|msg: sqs::Message| QueueItem::try_from(msg))
-                    .filter_map(|opt_item| opt_item.ok())
+                    .collect::<Vec<_>>()
+            })
+    }
+
+    pub fn receive_messages_sync(
+        &self,
+        wait_time_seconds: i64,
+    ) -> Result<Vec<QueueItem<T>>, Error> {
+        let msg = sqs::ReceiveMessageRequest {
+            attribute_names: Some(vec!["ALL".into()]),
+            max_number_of_messages: None,
+            message_attribute_names: Some(vec!["ALL".into()]),
+            queue_url: self.queue_url.clone(),
+            receive_request_attempt_id: None, // FIFO ONLY
+            visibility_timeout: None,
+            wait_time_seconds: Some(wait_time_seconds),
+        };
+
+        self.c
+            .receive_message(msg)
+            .sync()
+            .map_err(Error::from)
+            .map(|sqs_msg| {
+                sqs_msg
+                    .messages
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|msg: sqs::Message| QueueItem::try_from(msg))
                     .collect::<Vec<_>>()
             })
     }
@@ -251,7 +267,7 @@ where
     }
 
     pub fn stream_messages(&self, wait_time_seconds: i64) -> RecordStream<T> {
-        let initial_future = self.receive_messages(wait_time_seconds);
+        let initial_future = self.receive_messages_async(wait_time_seconds);
 
         RecordStream {
             queue: Queue {
