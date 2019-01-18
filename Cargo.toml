@@ -1,6 +1,6 @@
 [package]
 name = "sqs_wrapper"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Niclas Rosengren <niclas.rosengren@gmail.com>"]
 description = "Super simple wrapper around rusoto_sqs to suit specific needs"
 license = "MIT"
