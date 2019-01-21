@@ -113,8 +113,8 @@ pub struct Queue<T>
 where
     T: Send + 'static,
 {
-    queue_url: String,
-    region: Region,
+    pub queue_url: String,
+    pub region: Region,
     c: sqs::SqsClient,
 
     _phantom_data: std::marker::PhantomData<T>,
