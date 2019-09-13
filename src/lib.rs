@@ -123,7 +123,7 @@ where
 /// Try to convert the example in wait_and_read_one to use futures and Tokio.
 impl<T> Queue<T>
 where
-    T: DeserializeOwned + Send + 'static,
+    T: serde::de::DeserializeOwned + Send + 'static,
 {
     pub fn connect(region: Region, queue_url: String) -> Self {
         Queue {
@@ -181,22 +181,6 @@ where
         };
 
         self.c.purge_queue(req)
-    }
-
-    pub fn enqueue_message(
-        &self,
-        payload: String,
-    ) -> RusotoFuture<sqs::SendMessageResult, sqs::SendMessageError> {
-        let req = sqs::SendMessageRequest {
-            delay_seconds: None,
-            message_attributes: None,
-            message_deduplication_id: None,
-            message_group_id: None,
-            queue_url: self.queue_url.clone(),
-            message_body: payload,
-        };
-
-        self.c.send_message(req)
     }
 
     pub(crate) fn receive_messages_async(
@@ -280,6 +264,29 @@ where
             message_buffer: Vec::with_capacity(10),
             wait_time_seconds: wait_time_seconds,
         }
+    }
+}
+
+impl<T> Queue<T>
+where
+    T: serde::Serialize + Send + 'static,
+{
+    pub fn enqueue_message(
+        &self,
+        payload: &T,
+    ) -> RusotoFuture<sqs::SendMessageResult, sqs::SendMessageError> {
+        let serialized_payload = serde_json::to_string(payload).expect("Serializing payload");
+
+        let req = sqs::SendMessageRequest {
+            delay_seconds: None,
+            message_attributes: None,
+            message_deduplication_id: None,
+            message_group_id: None,
+            queue_url: self.queue_url.clone(),
+            message_body: serialized_payload,
+        };
+
+        self.c.send_message(req)
     }
 }
 
